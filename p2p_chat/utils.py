@@ -1,8 +1,22 @@
 """Utility helpers: unique IDs, timestamps, colored terminal output."""
 
-import uuid
+import socket
 import time
+import uuid
 from datetime import datetime
+
+
+def detect_lan_ip() -> str:
+    """Best-effort IPv4 used for outbound traffic (LAN address for bind/display)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2.0)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 
 def make_id() -> str:

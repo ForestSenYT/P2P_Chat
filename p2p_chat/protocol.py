@@ -147,20 +147,6 @@ def voice_mute_status(
     }
 
 
-def voice_speaking(
-    node_id: str,
-    speakers: list[str],
-) -> dict[str, Any]:
-    """Host broadcasts which members are currently speaking."""
-    return {
-        "id": make_id(),
-        "type": "voice_speaking",
-        "from": node_id,
-        "speakers": speakers,
-        "ts": timestamp(),
-    }
-
-
 def voice_force_mute(
     node_id: str,
     room: str,

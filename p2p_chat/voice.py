@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import array
 import asyncio
+import collections
 import queue
-import socket as _sock
 import struct
 import threading
 import time as _time
@@ -26,7 +26,7 @@ except ImportError:
 
 from .crypto import decrypt_bytes, encrypt_bytes
 from .protocol import voice_join, voice_leave
-from .utils import fmt_error, fmt_voice
+from .utils import detect_lan_ip, fmt_error, fmt_voice
 
 # ── Audio parameters ────────────────────────────────────────────────
 RATE = 16000
@@ -42,6 +42,19 @@ SEQ_STRUCT = struct.Struct("!I")
 VOICE_HEADER = ROOM_FIELD + ID_FIELD + SEQ_STRUCT.size
 
 SILENCE = b"\x00" * CHUNK_BYTES
+
+# int16 peak below this ≈ silence / fan noise; above ≈ "you are speaking" for UI.
+_MIC_SPEECH_PEAK_THRESHOLD = 700
+
+
+def _pcm_peak_abs(pcm: bytes) -> int:
+    if len(pcm) < 2:
+        return 0
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    if not samples:
+        return 0
+    return max(abs(x) for x in samples)
 
 
 def _pad(text: str, length: int) -> bytes:
@@ -78,17 +91,6 @@ def _mix_chunks(chunks: list[bytes]) -> bytes:
         for i in range(min(len(mixed), len(other))):
             mixed[i] = max(-32768, min(32767, mixed[i] + other[i]))
     return mixed.tobytes()
-
-
-def _detect_lan_ip() -> str:
-    try:
-        s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
 
 
 class _VoiceUDP(asyncio.DatagramProtocol):
@@ -148,7 +150,7 @@ class VoiceEngine:
         self.username = username
         self.host = host
         self.udp_port = udp_port
-        self.public_host = _detect_lan_ip()
+        self.public_host = detect_lan_ip()
         self.is_host = is_host
 
         self.active_room: str | None = None
@@ -172,7 +174,10 @@ class VoiceEngine:
         self._peer_muted: dict[str, bool] = {}
         self._peer_last_active: dict[str, float] = {}
         self._peer_decrypt_ok: dict[str, bool | None] = {}
-        self._self_last_active: float = 0.0
+        # Local mic: last frame level 0..1 (for GUI meter).
+        self._mic_level: float = 0.0
+        # monotonic timestamp when PCM peak crossed speech threshold.
+        self._last_voice_activity: float = 0.0
 
         self.on_mute_change: Any = None
 
@@ -183,11 +188,13 @@ class VoiceEngine:
         self._udp_transport: asyncio.DatagramTransport | None = None
         self._send_task: asyncio.Task | None = None
         self._mix_task: asyncio.Task | None = None
-        self._capture_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+        # Created in start() on the asyncio thread — not in __init__, because
+        # the GUI constructs VoiceEngine on the main thread (wrong default loop).
+        self._capture_queue: asyncio.Queue[bytes] | None = None
         self._playback_queue: queue.Queue[bytes] = queue.Queue(maxsize=50)
 
-        # Per-sender latest audio frame (for host mixing).
-        self._peer_buffers: dict[str, bytes] = {}
+        # Per-sender audio frame queue (for host mixing).
+        self._peer_buffers: dict[str, collections.deque[bytes]] = {}
         self._peer_seq: dict[str, int] = {}
         # Per-sender real UDP address (for host to reply).
         self._peer_addrs: dict[str, tuple[str, int]] = {}
@@ -203,6 +210,7 @@ class VoiceEngine:
             print(fmt_error("pyaudio is not installed. Voice chat disabled."))
             return
         self._loop = asyncio.get_running_loop()
+        self._capture_queue = asyncio.Queue(maxsize=50)
         transport, _ = await self._loop.create_datagram_endpoint(
             lambda: _VoiceUDP(self._on_udp_recv),
             local_addr=("0.0.0.0", self.udp_port),
@@ -278,6 +286,14 @@ class VoiceEngine:
         self._send_task = None
         self._mix_task = None
 
+        cap_q = self._capture_queue
+        if cap_q is not None:
+            while True:
+                try:
+                    cap_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
         if self._capture_thread:
             self._capture_thread.join(timeout=1.0)
             self._capture_thread = None
@@ -335,16 +351,6 @@ class VoiceEngine:
         elif mtype == "voice_mute_status":
             self._peer_muted[sender] = msg.get("muted", False)
 
-        elif mtype == "voice_speaking":
-            # Host broadcasts who's speaking; clients update their display.
-            speakers = set(msg.get("speakers", []))
-            now = _time.monotonic()
-            for nid in self.voice_members:
-                if nid == self.node_id:
-                    continue
-                if nid in speakers:
-                    self._peer_last_active[nid] = now
-
         elif mtype == "voice_force_mute":
             target = msg.get("target", "")
             forced = msg.get("muted", True)
@@ -376,11 +382,35 @@ class VoiceEngine:
     def is_peer_muted(self, node_id: str) -> bool:
         return self._peer_muted.get(node_id, False)
 
-    def is_self_speaking(self, threshold: float = 0.5) -> bool:
-        return (_time.monotonic() - self._self_last_active) < threshold
+    def is_self_speaking(self, threshold: float = 0.35) -> bool:
+        """True if recent mic frames had speech-level energy (not just unmuted)."""
+        return (_time.monotonic() - self._last_voice_activity) < threshold
+
+    @property
+    def mic_input_level(self) -> float:
+        """0..1 peak-based level for local feedback UI (last captured frame)."""
+        return self._mic_level
 
     def is_peer_encrypted(self, node_id: str) -> bool | None:
         return self._peer_decrypt_ok.get(node_id)
+
+    def _enqueue_capture(self, data: bytes) -> None:
+        """Thread-safe: put PCM on the asyncio capture queue (same loop as _send_loop)."""
+        loop = self._loop
+        cap_q = self._capture_queue
+        if loop is None or cap_q is None or not self._running:
+            return
+
+        def _put() -> None:
+            try:
+                cap_q.put_nowait(data)
+            except asyncio.QueueFull:
+                pass
+
+        try:
+            loop.call_soon_threadsafe(_put)
+        except RuntimeError:
+            pass
 
     # ── Capture thread ──────────────────────────────────────────────
 
@@ -400,15 +430,14 @@ class VoiceEngine:
         try:
             while self._running:
                 data = stream.read(CHUNK, exception_on_overflow=False)
+                peak = _pcm_peak_abs(data)
+                self._mic_level = min(1.0, peak / 10000.0)
                 if self.muted:
+                    self._mic_level = 0.0
                     continue
-                self._self_last_active = _time.monotonic()
-                try:
-                    self._loop.call_soon_threadsafe(
-                        self._capture_queue.put_nowait, data
-                    )
-                except (asyncio.QueueFull, RuntimeError):
-                    pass
+                if peak >= _MIC_SPEECH_PEAK_THRESHOLD:
+                    self._last_voice_activity = _time.monotonic()
+                self._enqueue_capture(data)
         except OSError:
             pass
         finally:
@@ -453,10 +482,12 @@ class VoiceEngine:
         keepalive_interval = 1.0  # seconds
         last_keepalive = 0.0
 
+        cap_q = self._capture_queue
+        if cap_q is None:
+            return
         while self._running:
             try:
-                pcm = await asyncio.wait_for(
-                    self._capture_queue.get(), timeout=0.1)
+                pcm = await asyncio.wait_for(cap_q.get(), timeout=0.1)
             except asyncio.TimeoutError:
                 # No capture data (muted or idle).  Send keepalive if
                 # enough time has passed so the host learns our address.
@@ -475,13 +506,14 @@ class VoiceEngine:
             packet = encode_voice_packet(room, self.node_id, self._seq, payload)
 
             if self.is_host:
-                self._peer_buffers[self.node_id] = pcm
+                self._peer_buffers.setdefault(
+                    self.node_id, collections.deque(maxlen=50)).append(pcm)
             else:
                 self._send_to_host(packet)
                 last_keepalive = _time.monotonic()
 
     def _send_to_host(self, packet: bytes) -> None:
-        """Send a UDP packet to the host (first peer with a real UDP address)."""
+        """Send a UDP packet to the host (first peer in voice_peers)."""
         room = self.active_room
         if not room or not self._udp_transport:
             return
@@ -489,13 +521,11 @@ class VoiceEngine:
         for nid, (host, port, _) in peers.items():
             if nid == self.node_id:
                 continue
-            if not host or not port:
-                continue  # display-only entry (other client), skip
             try:
                 self._udp_transport.sendto(packet, (host, port))
             except OSError:
                 pass
-            break  # only send to host
+            break  # only send to host (first peer)
 
     def _send_keepalive(self) -> None:
         """Send a silent packet so the host learns our UDP address."""
@@ -517,26 +547,31 @@ class VoiceEngine:
             if not self._udp_transport or not self.active_room:
                 continue
 
-            # Snapshot and clear buffers.
-            buffers = dict(self._peer_buffers)
-            self._peer_buffers.clear()
+            # Pop one frame (FIFO) from each sender's deque.
+            frame: dict[str, bytes] = {}
+            for sid, dq in list(self._peer_buffers.items()):
+                if dq:
+                    frame[sid] = dq.popleft()
 
-            if not buffers:
+            if not frame:
                 continue
 
             room = self.active_room
-            peers = self.voice_peers.get(room, {})
 
+            # For each connected voice client, mix everyone EXCEPT them.
+            peers = self.voice_peers.get(room, {})
             for nid in list(peers):
                 if nid == self.node_id:
                     continue
                 addr = self._peer_addrs.get(nid)
                 if not addr:
                     continue
-                others = [c for sid, c in buffers.items() if sid != nid]
+
+                others = [c for sid, c in frame.items() if sid != nid]
                 if not others:
                     continue
                 mixed = _mix_chunks(others)
+
                 payload = encrypt_bytes(mixed, self.room_key) if self.room_key else mixed
                 self._seq = (self._seq + 1) & 0xFFFFFFFF
                 packet = encode_voice_packet(
@@ -546,7 +581,8 @@ class VoiceEngine:
                 except OSError:
                     pass
 
-            host_others = [c for sid, c in buffers.items()
+            # Host plays mixed audio locally (all others).
+            host_others = [c for sid, c in frame.items()
                            if sid != self.node_id]
             if host_others:
                 mixed_for_host = _mix_chunks(host_others)
@@ -597,7 +633,8 @@ class VoiceEngine:
 
         if self.is_host:
             # Host: store in buffer, mixer task will distribute.
-            self._peer_buffers[sender] = pcm
+            self._peer_buffers.setdefault(
+                sender, collections.deque(maxlen=50)).append(pcm)
         else:
             # Client: play directly (already mixed by host).
             try:

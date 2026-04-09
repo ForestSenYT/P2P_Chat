@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from typing import Callable
 
 from .protocol import decode, encode, peer_hello, peer_list
@@ -107,9 +108,23 @@ class Node:
     async def start(self) -> None:
         """Start listening (host always listens; client doesn't need to)."""
         if self.is_host:
-            self._server = await asyncio.start_server(
-                self._handle_inbound, self.host, self.port
-            )
+            # Prefer IPv4-only bind for 0.0.0.0 on Windows; fall back if OS rejects it.
+            if self.host == "0.0.0.0":
+                try:
+                    self._server = await asyncio.start_server(
+                        self._handle_inbound,
+                        self.host,
+                        self.port,
+                        family=socket.AF_INET,
+                    )
+                except OSError:
+                    self._server = await asyncio.start_server(
+                        self._handle_inbound, self.host, self.port
+                    )
+            else:
+                self._server = await asyncio.start_server(
+                    self._handle_inbound, self.host, self.port
+                )
             self._notify(f"Channel hosted on port {self.port}")
 
     async def stop(self) -> None:
@@ -253,8 +268,7 @@ class Node:
 
         # ── Deliver to local UI ─────────────────────────────────────
         if msg_type in ("voice_join", "voice_leave",
-                        "voice_mute_status", "voice_force_mute",
-                        "voice_speaking"):
+                        "voice_mute_status", "voice_force_mute"):
             if self.on_voice_signal:
                 self.on_voice_signal(msg)
         if self.on_message:

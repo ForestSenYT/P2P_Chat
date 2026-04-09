@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import os
 import random
 import threading
@@ -28,7 +29,7 @@ from .node import Node
 from .protocol import (channel_config, chat_message, image_message,
                        room_create, room_delete,
                        voice_force_mute, voice_mute_status)
-from .utils import timestamp
+from .utils import detect_lan_ip, timestamp
 from .voice import VoiceEngine, list_input_devices, list_output_devices
 
 try:
@@ -51,6 +52,10 @@ FG_MAGENTA = "#c678dd"
 FG_CYAN = "#56b6c2"
 FONT_FAMILY = "Consolas"
 
+# Voice leave() can need ~2s thread joins plus PyAudio teardown; 3s is too tight.
+_ASYNC_SHUTDOWN_TIMEOUT = 25.0
+_STARTUP_TIMEOUT = 20.0
+
 
 class ChatGUI:
     """Main GUI window — replaces the CLI as the user-facing layer."""
@@ -66,6 +71,8 @@ class ChatGUI:
         self.loop = loop
         self.room = "general"
         self._closing = False
+        # Set True when WM_DELETE shutdown coroutine finished (avoids duplicate cleanup).
+        self._async_shutdown_ok = False
 
         # Per-room message history so switching rooms keeps context.
         self._room_history: dict[str, list[tuple[str, str]]] = {}
@@ -110,6 +117,7 @@ class ChatGUI:
         # Kick off periodic refreshes.
         self._schedule_peer_refresh()
         self._schedule_voice_refresh()
+        self.root.after(100, self._schedule_mic_meter)
 
     # ── Helpers ─────────────────────────────────────────────────────
 
@@ -166,6 +174,14 @@ class ChatGUI:
         style.map("TCheckbutton",
                   background=[("active", BG_MID)],
                   foreground=[("active", FG_DEFAULT)])
+        # Horizontal progress bars use layout "Horizontal.TProgressbar" — do not
+        # invent "Mic.TProgressbar" without style.layout(...) or Tcl errors.
+        style.configure(
+            "Horizontal.TProgressbar",
+            troughcolor=BG_DARK,
+            background=FG_GREEN,
+            borderwidth=0,
+        )
         style.configure("Side.TLabelframe", background=BG_MID,
                          foreground=FG_ACCENT)
         style.configure("Side.TLabelframe.Label", background=BG_MID,
@@ -290,14 +306,7 @@ class ChatGUI:
             ttk.Label(cf, text=f"Port: {self.node.port}",
                       foreground=FG_GREEN).pack(padx=4, pady=4)
 
-            import socket as _sock
-            try:
-                s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                local_ip = s.getsockname()[0]
-                s.close()
-            except Exception:
-                local_ip = "127.0.0.1"
+            local_ip = detect_lan_ip()
 
             ttk.Label(cf, text="Others join with:",
                       foreground=FG_DIM).pack(padx=4)
@@ -408,6 +417,29 @@ class ChatGUI:
             self._voice_ctrl, text="Mute", command=self._on_voice_mute,
             state=tk.DISABLED)
         self.btn_voice_mute.pack(side=tk.LEFT, padx=2)
+
+        # Local mic feedback (your voice only — helps tell "me vs them").
+        self._mic_fb_row = ttk.Frame(self.voice_panel)
+        self._mic_fb_row.pack(fill=tk.X, padx=4, pady=(0, 4))
+        ttk.Label(
+            self._mic_fb_row, text="本机麦", foreground=FG_DIM,
+            font=(FONT_FAMILY, 9),
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        self._mic_status = ttk.Label(
+            self._mic_fb_row,
+            text="未加入语音",
+            font=(FONT_FAMILY, 9),
+            foreground=FG_DIM,
+        )
+        self._mic_status.pack(side=tk.LEFT, padx=(0, 8))
+        self._mic_meter = ttk.Progressbar(
+            self._mic_fb_row,
+            length=160,
+            maximum=100,
+            mode="determinate",
+            orient=tk.HORIZONTAL,
+        )
+        self._mic_meter.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # Audio device selection row
         dev_frame = ttk.Frame(self.voice_panel)
@@ -1328,22 +1360,39 @@ class ChatGUI:
             return
         if not self._sash_dragging:
             self._refresh_voice_users()
-        # Host: broadcast who's currently speaking so clients can
-        # update their voice user list indicators.
-        if self.node.is_host and self.voice.active_room:
-            self._broadcast_speaking_state()
         self.root.after(500, self._schedule_voice_refresh)
 
-    def _broadcast_speaking_state(self) -> None:
-        from .protocol import voice_speaking
-        speakers = []
-        for nid in self.voice.voice_members:
-            if self.voice.is_peer_speaking(nid):
-                speakers.append(nid)
-            elif nid == self.node.node_id and self.voice.is_self_speaking():
-                speakers.append(nid)
-        msg = voice_speaking(self.node.node_id, speakers)
-        self._run_async(self.node.broadcast(msg))
+    def _schedule_mic_meter(self) -> None:
+        """Local mic level + speech detection (~10 Hz), independent of UDP."""
+        if self._closing:
+            return
+        if self.voice.active_room:
+            if self.voice.muted or self.voice.force_muted:
+                self._mic_meter.configure(value=0)
+                self._mic_status.configure(
+                    text="已静音（本机不发送）",
+                    foreground=FG_RED,
+                )
+            else:
+                pct = int(min(100, max(0, self.voice.mic_input_level * 100)))
+                self._mic_meter.configure(value=pct)
+                if self.voice.is_self_speaking():
+                    self._mic_status.configure(
+                        text="检测到说话 — 本机正在发送语音",
+                        foreground=FG_GREEN,
+                    )
+                else:
+                    self._mic_status.configure(
+                        text="未检测到明显人声（安静或音量偏低）",
+                        foreground=FG_DIM,
+                    )
+        else:
+            self._mic_meter.configure(value=0)
+            self._mic_status.configure(
+                text="未加入语音",
+                foreground=FG_DIM,
+            )
+        self.root.after(100, self._schedule_mic_meter)
 
     # ── Shutdown ────────────────────────────────────────────────────
 
@@ -1356,9 +1405,12 @@ class ChatGUI:
 
         future = asyncio.run_coroutine_threadsafe(_shutdown(), self.loop)
         try:
-            future.result(timeout=3)
+            future.result(timeout=_ASYNC_SHUTDOWN_TIMEOUT)
+            self._async_shutdown_ok = True
+        except concurrent.futures.TimeoutError:
+            self._async_shutdown_ok = False
         except Exception:
-            pass
+            self._async_shutdown_ok = False
 
         self.root.destroy()
 
@@ -1549,6 +1601,10 @@ def launch_gui() -> None:
     udp_port = port
 
     node = Node(host, port, username, is_host=is_host)
+    # Bind 0.0.0.0 for listen, but advertise a real IP in node_id (hello / voice).
+    if is_host and host == "0.0.0.0":
+        node.node_id = f"{detect_lan_ip()}:{port}"
+
     voice = VoiceEngine(node.node_id, username, host, udp_port,
                         is_host=is_host)
 
@@ -1582,7 +1638,7 @@ def launch_gui() -> None:
 
     future = asyncio.run_coroutine_threadsafe(_startup(), loop)
     try:
-        future.result(timeout=10)
+        future.result(timeout=_STARTUP_TIMEOUT)
     except Exception as exc:
         startup_error = f"Startup failed:\n{type(exc).__name__}: {exc}"
 
@@ -1592,13 +1648,44 @@ def launch_gui() -> None:
         from tkinter import messagebox
         messagebox.showerror("Startup Error", startup_error)
         err.destroy()
-        asyncio.run_coroutine_threadsafe(node.stop(), loop)
+
+        async def _cleanup_failed_startup() -> None:
+            try:
+                await voice.stop()
+            except Exception:
+                pass
+            try:
+                await node.stop()
+            except Exception:
+                pass
+
+        fut = asyncio.run_coroutine_threadsafe(_cleanup_failed_startup(), loop)
+        try:
+            fut.result(timeout=_ASYNC_SHUTDOWN_TIMEOUT)
+        except Exception:
+            pass
         loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=2)
+        thread.join(timeout=5)
         return
 
     gui = ChatGUI(node, voice, loop)
     gui.run()
 
+    if not gui._async_shutdown_ok:
+        async def _cleanup_after_gui() -> None:
+            try:
+                await voice.stop()
+            except Exception:
+                pass
+            try:
+                await node.stop()
+            except Exception:
+                pass
+
+        fut = asyncio.run_coroutine_threadsafe(_cleanup_after_gui(), loop)
+        try:
+            fut.result(timeout=_ASYNC_SHUTDOWN_TIMEOUT)
+        except Exception:
+            pass
     loop.call_soon_threadsafe(loop.stop)
-    thread.join(timeout=3)
+    thread.join(timeout=5)
